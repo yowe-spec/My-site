@@ -1,0 +1,408 @@
+<!DOCTYPE html><html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Game Balap Lengkap (Fix Map, Sprite vs Hitbox)</title>
+  <style>
+    :root {
+      --ui-bg: rgba(0,0,0,0.5);
+      --ui-bg-strong: rgba(0,0,0,0.8);
+      --ui-text: #fff;
+    }
+    body { margin:0; overflow:hidden; background:#000; color:var(--ui-text); font-family:sans-serif; }
+    canvas { display:block; background:#000; }
+    #hud {
+      position:fixed; top:8px; left:8px; z-index:5;
+      background:var(--ui-bg); padding:4px 8px; border-radius:6px; font-size:14px;
+    }
+    #settingsBtn {
+      position:fixed; top:8px; right:8px; z-index:6;
+      background:var(--ui-bg); color:var(--ui-text); border:none; border-radius:6px; padding:4px 10px; font-size:20px; line-height:1;
+    }
+    #debugBtn {
+      position:fixed; bottom:8px; left:8px; z-index:6;
+      background:var(--ui-bg-strong); color:var(--ui-text); border:none; border-radius:6px; padding:4px 10px; font-size:14px;
+    }
+    #settingsPanel {
+      position:fixed; top:44px; right:8px; z-index:7;
+      display:none; flex-direction:column; gap:4px; min-width:140px;
+      background:var(--ui-bg-strong); padding:8px; border-radius:6px; font-size:14px; color:var(--ui-text);
+    }
+    #settingsPanel button {
+      width:100%; padding:4px 8px; border:none; border-radius:4px; background:#555; color:#fff; font-size:14px;
+    }
+    #settingsPanel button.active { background:#f33; }
+    #overlay {
+      position:fixed; inset:0; z-index:10;
+      display:flex; flex-direction:column; justify-content:center; align-items:center;
+      background:rgba(0,0,0,0.7); color:#fff; font-size:2em; visibility:hidden;
+    }
+    #overlay button {
+      margin-top:20px; padding:10px 20px; font-size:1em; border:none; border-radius:8px; background:#f33; color:white;
+    }
+    .floating-text {
+      position:fixed; color:#0f0; font-weight:bold; font-size:18px; pointer-events:none; opacity:1;
+      animation:floatUp 0.6s ease-out forwards;
+    }
+    @keyframes floatUp { 0%{ transform:translateY(0); opacity:1;} 100%{ transform:translateY(-30px); opacity:0;} }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="hud">Diff: <span id="hudDiff">Normal</span> | Poin: <span id="score">0</span> | High Score: <span id="highScore">0</span></div>
+  <button id="settingsBtn">⚙️</button>
+  <button id="debugBtn">Debug OFF</button>
+  <div id="settingsPanel">
+    <strong>Pilih Difficulty:</strong>
+    <button data-diff="easy">Easy</button>
+    <button data-diff="normal" class="active">Normal</button>
+    <button data-diff="hard">Hard</button>
+    <button data-diff="impossible">Impossible</button>
+  </div>
+  <div id="overlay">
+    <div>TABRAKAN!</div>
+    <button id="restartBtn">Restart</button>
+  </div>
+  <audio id="engineSound" src="https://actions.google.com/sounds/v1/vehicles/car_engine.ogg" loop></audio>
+  <audio id="crashSound"  src="https://actions.google.com/sounds/v1/impacts/crash.ogg"></audio>
+  <audio id="tingSound"   src="https://www.soundjay.com/buttons/sounds/button-3.mp3"></audio>  <script>
+  /* =====================================================
+     KONFIGURASI DASAR
+     ===================================================== */
+  const PLAYER_SRC   = 'player.png';
+  const TRAFFIC1_SRC = 'traffic1.png';
+  const TRAFFIC2_SRC = 'traffic2.png';
+
+  // Flag rotasi 180° (set true kalau sprite menghadap arah salah)
+  const PLAYER_FLIP   = false;
+  const TRAFFIC1_FLIP = false;
+  const TRAFFIC2_FLIP = false;
+
+  // >>> SKALA SPRITE SESUAI PERMINTAAN (0.5 - 0.4 range) <<<
+  // Kamu bilang 0.5–0.4 bagus. Default saya set 0.45 untuk player.
+  const PLAYER_SCALE_TRACK   = 0.45; // 45% lebar lintasan
+  const TRAFFIC1_SCALE_TRACK = 0.40; // 40% lebar lintasan (lebih kecil)
+  const TRAFFIC2_SCALE_TRACK = 0.40; // samakan 40% supaya tidak kebesaran
+
+  // Hitbox shrink (persentase dari sprite). 0.8 = 80%.
+  const HITBOX_SCALE_PLAYER  = 0.40;
+  const HITBOX_SCALE_TRAFFIC = 0.40;
+
+  // Rasio cadangan kalau img belum load (tinggi/lebar)
+  const FALLBACK_ASPECT = 2.0;
+
+  /* =====================================================
+     AMBIL ELEMEN DOM
+     ===================================================== */
+  const canvas         = document.getElementById('game');
+  const ctx            = canvas.getContext('2d');
+  const hudDiffEl      = document.getElementById('hudDiff');
+  const scoreEl        = document.getElementById('score');
+  const highScoreEl    = document.getElementById('highScore');
+  const settingsBtn    = document.getElementById('settingsBtn');
+  const settingsPanel  = document.getElementById('settingsPanel');
+  const debugBtn       = document.getElementById('debugBtn');
+  const overlay        = document.getElementById('overlay');
+  const restartBtn     = document.getElementById('restartBtn');
+  const engineSound    = document.getElementById('engineSound');
+  const crashSound     = document.getElementById('crashSound');
+  const tingSound      = document.getElementById('tingSound');
+
+  /* =====================================================
+     GAMBAR SPRITE
+     ===================================================== */
+  const playerImg   = new Image(); playerImg.src   = PLAYER_SRC;
+  const trafficImg1 = new Image(); trafficImg1.src = TRAFFIC1_SRC;
+  const trafficImg2 = new Image(); trafficImg2.src = TRAFFIC2_SRC;
+
+  let assetsLoaded = 0; const TOTAL_ASSETS = 3;
+  function onAsset(){ assetsLoaded++; if(assetsLoaded>=TOTAL_ASSETS){ startGame(); } }
+  playerImg.onload=onAsset; trafficImg1.onload=onAsset; trafficImg2.onload=onAsset;
+  playerImg.onerror=onAsset; trafficImg1.onerror=onAsset; trafficImg2.onerror=onAsset;
+
+  /* =====================================================
+     VARIABEL GAME
+     ===================================================== */
+  let trackWidth=0, trackX=0;
+  let lineOffset=0, lineSpeed=5; // untuk garis tengah putus-putus
+
+  // skor
+  let score=0; let highScore=parseInt(localStorage.getItem('highScore'))||0; highScoreEl.textContent=highScore;
+
+  // debug
+  let debugMode=false;
+  debugBtn.addEventListener('click',()=>{ debugMode=!debugMode; debugBtn.textContent=debugMode?"Debug ON":"Debug OFF"; });
+
+  // objek pemain: gunakan koordinat HITBOX untuk x,y,w,h
+  const car = { x:0, y:0, boxW:0, boxH:0, spriteW:0, spriteH:0 };
+
+  // enemies array
+  const enemies=[]; // tiap item {type, x,y, boxW,boxH, spriteW,spriteH, speed}
+
+  /* =====================================================
+     UTIL: ASPECT RATIO DARI GAMBAR
+     ===================================================== */
+  function imgAspect(img){
+    if(img && img.naturalWidth>0 && img.naturalHeight>0){ return img.naturalHeight/img.naturalWidth; }
+    return FALLBACK_ASPECT;
+  }
+
+  /* =====================================================
+     RESIZE & PENYESUAIAN UKURAN SPRITE + HITBOX
+     ===================================================== */
+  function resizeCanvas(){
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    trackWidth = Math.min(300, canvas.width * 0.6); // lebar lintasan
+    trackX      = (canvas.width - trackWidth) / 2;
+    updateCarSize();
+    resetCar();
+    enemies.forEach(e=>applyEnemySize(e));
+  }
+  window.addEventListener('resize',()=>{ resizeCanvas(); });
+
+  function updateCarSize(){
+    const aspect = imgAspect(playerImg);
+    car.spriteW = trackWidth * PLAYER_SCALE_TRACK;
+    car.spriteH = car.spriteW * aspect;
+    car.boxW    = car.spriteW * HITBOX_SCALE_PLAYER;
+    car.boxH    = car.spriteH * HITBOX_SCALE_PLAYER;
+  }
+
+  function resetCar(){
+    car.x = canvas.width/2 - car.boxW/2;
+    car.y = canvas.height - car.boxH - 20;
+  }
+
+  function applyEnemySize(e){
+    const img  = (e.type===1?trafficImg1:trafficImg2);
+    const sc   = (e.type===1?TRAFFIC1_SCALE_TRACK:TRAFFIC2_SCALE_TRACK);
+    const aspect = imgAspect(img);
+    e.spriteW = trackWidth * sc;
+    e.spriteH = e.spriteW * aspect;
+    e.boxW    = e.spriteW * HITBOX_SCALE_TRAFFIC;
+    e.boxH    = e.spriteH * HITBOX_SCALE_TRAFFIC;
+  }
+
+  /* =====================================================
+     DIFFICULTY & ENEMY SPAWN
+     ===================================================== */
+  const difficultyCfg = {
+    easy:       {enemyCount:1, speedMin:2, speedMax:3,  roadSpeed:4},
+    normal:     {enemyCount:2, speedMin:3, speedMax:5,  roadSpeed:5},
+    hard:       {enemyCount:3, speedMin:4, speedMax:7,  roadSpeed:7},
+    impossible: {enemyCount:5, speedMin:6, speedMax:10, roadSpeed:10}
+  };
+  let currentDiff='normal';
+
+  function randRange(a,b){ return a + Math.random()*(b-a); }
+
+  function spawnEnemy(i,min,max){
+    const type = Math.random()<0.5?1:2;
+    const e = {type, x:0, y:-100 - i*200, boxW:0,boxH:0, spriteW:0,spriteH:0, speed:randRange(min,max)};
+    applyEnemySize(e);
+    e.x = trackX + Math.random()*(trackWidth - e.boxW);
+    return e;
+  }
+
+  function createEnemies(count,min,max){
+    enemies.length=0;
+    for(let i=0;i<count;i++){ enemies.push(spawnEnemy(i,min,max)); }
+  }
+
+  function applyDifficulty(diff){
+    currentDiff=diff;
+    const cfg=difficultyCfg[diff];
+    lineSpeed = cfg.roadSpeed;
+    createEnemies(cfg.enemyCount,cfg.speedMin,cfg.speedMax);
+    hudDiffEl.textContent = diff.charAt(0).toUpperCase()+diff.slice(1);
+    document.querySelectorAll('#settingsPanel button[data-diff]').forEach(btn=>{
+      btn.classList.toggle('active',btn.dataset.diff===diff);
+    });
+  }
+
+  settingsBtn.addEventListener('click',()=>{
+    settingsPanel.style.display = settingsPanel.style.display==='flex'?'none':'flex';
+  });
+  settingsPanel.addEventListener('click',(e)=>{
+    const diff = e.target.dataset.diff; if(!diff) return; applyDifficulty(diff);
+  });
+
+  /* =====================================================
+     INPUT (KIRI/KANAN)
+     ===================================================== */
+  let keys={}, touchLeft=false, touchRight=false;
+  window.addEventListener('keydown', e=>keys[e.key]=true);
+  window.addEventListener('keyup',   e=>keys[e.key]=false);
+  window.addEventListener('touchstart', e=>{
+    const x=e.touches[0].clientX; if(x<window.innerWidth/2) touchLeft=true; else touchRight=true;
+  });
+  window.addEventListener('touchend', ()=>{ touchLeft=false; touchRight=false; });
+
+  function updateCar(){
+    if(keys['ArrowLeft']||touchLeft)  car.x-=5;
+    if(keys['ArrowRight']||touchRight) car.x+=5;
+    if(car.x<trackX) car.x=trackX;
+    if(car.x+car.boxW>trackX+trackWidth) car.x=trackX+trackWidth-car.boxW;
+  }
+
+  /* =====================================================
+     SCORE & FLOATING TEXT
+     ===================================================== */
+  function showFloatingText(text,x,y){
+    const ft=document.createElement('div');
+    ft.className='floating-text';
+    ft.textContent=text;
+    ft.style.left=x+'px'; ft.style.top=y+'px';
+    document.body.appendChild(ft);
+    setTimeout(()=>ft.remove(),600);
+  }
+
+  function addScore(points){
+    score+=points; scoreEl.textContent=score;
+    tingSound.currentTime=0; tingSound.play();
+    showFloatingText('+'+points, car.x+car.boxW/2, car.y);
+    if(score>highScore){ highScore=score; highScoreEl.textContent=highScore; localStorage.setItem('highScore',highScore); }
+  }
+
+  /* =====================================================
+     ENEMY UPDATE
+     ===================================================== */
+  function updateEnemies(){
+    const cfg=difficultyCfg[currentDiff];
+    enemies.forEach(e=>{
+      e.y += e.speed;
+      if(e.y>canvas.height+e.boxH){
+        // lewat → poin
+        const pts = (e.type===1?10:20);
+        addScore(pts);
+        // respawn
+        e.type = Math.random()<0.5?1:2;
+        applyEnemySize(e);
+        e.y = -100 - Math.random()*200;
+        e.x = trackX + Math.random()*(trackWidth - e.boxW);
+        e.speed = randRange(cfg.speedMin,cfg.speedMax);
+      }
+    });
+  }
+
+  /* =====================================================
+     COLLISION (PAKAI HITBOX)
+     ===================================================== */
+  function checkCollision(){
+    return enemies.some(e=> (
+      car.x < e.x + e.boxW &&
+      car.x + car.boxW > e.x &&
+      car.y < e.y + e.boxH &&
+      car.y + car.boxH > e.y
+    ));
+  }
+
+  /* =====================================================
+     GAMBAR: TRACK, PLAYER, ENEMIES
+     ===================================================== */
+  function drawPixelGrass(){
+    // pixel-art rumput hijau di luar lintasan
+    const size=40;
+    for(let y=0;y<canvas.height;y+=size){
+      for(let x=0;x<canvas.width;x+=size){
+        ctx.fillStyle=((x/size + y/size)&1)?'#1b1':'#2d2';
+        ctx.fillRect(x,y,size,size);
+      }
+    }
+  }
+  function drawTrack(){
+    // jalan abu-abu
+    ctx.fillStyle='#555';
+    ctx.fillRect(trackX,0,trackWidth,canvas.height);
+    // garis tepi putih
+    ctx.fillStyle='#fff';
+    ctx.fillRect(trackX,0,4,canvas.height);
+    ctx.fillRect(trackX+trackWidth-4,0,4,canvas.height);
+    // garis tengah putus-putus
+    ctx.strokeStyle='#fff';
+    ctx.lineWidth=3;
+    ctx.setLineDash([20,20]);
+    ctx.lineDashOffset=lineOffset;
+    ctx.beginPath();
+    ctx.moveTo(trackX+trackWidth/2,0);
+    ctx.lineTo(trackX+trackWidth/2,canvas.height);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  function drawPlayer(){
+    ctx.save();
+    ctx.translate(car.x+car.boxW/2, car.y+car.boxH/2);
+    if(PLAYER_FLIP) ctx.rotate(Math.PI);
+    ctx.drawImage(playerImg, -car.spriteW/2, -car.spriteH/2, car.spriteW, car.spriteH);
+    ctx.restore();
+    if(debugMode){ ctx.strokeStyle='red'; ctx.lineWidth=2; ctx.strokeRect(car.x,car.y,car.boxW,car.boxH); }
+  }
+
+  function drawEnemies(){
+    enemies.forEach(e=>{
+      const img = (e.type===1?trafficImg1:trafficImg2);
+      const flip= (e.type===1?TRAFFIC1_FLIP:TRAFFIC2_FLIP);
+      ctx.save();
+      ctx.translate(e.x+e.boxW/2, e.y+e.boxH/2);
+      if(flip) ctx.rotate(Math.PI);
+      ctx.drawImage(img, -e.spriteW/2, -e.spriteH/2, e.spriteW, e.spriteH);
+      ctx.restore();
+      if(debugMode){ ctx.strokeStyle='blue'; ctx.lineWidth=2; ctx.strokeRect(e.x,e.y,e.boxW,e.boxH); }
+    });
+  }
+
+  /* =====================================================
+     GAME LOOP
+     ===================================================== */
+  let gameOver=false, loopId=null;
+  function gameLoop(){
+    if(gameOver) return;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    drawPixelGrass();      // latar hijau
+    drawTrack();           // jalan abu-abu di atasnya
+    drawPlayer();
+    drawEnemies();
+    updateCar();
+    updateEnemies();
+    // update garis tengah animasi
+    lineOffset += lineSpeed*0.5; if(lineOffset>40) lineOffset=0;
+    if(checkCollision()){
+      crashSound.currentTime=0; crashSound.play();
+      endGame();
+      return;
+    }
+    loopId=requestAnimationFrame(gameLoop);
+  }
+
+  function endGame(){
+    gameOver=true;
+    overlay.style.visibility='visible';
+    engineSound.pause();
+  }
+
+  restartBtn.addEventListener('click',restartGame);
+  overlay.addEventListener('click',restartGame);
+  function restartGame(){
+    if(loopId) cancelAnimationFrame(loopId);
+    score=0; scoreEl.textContent=0;
+    gameOver=false; overlay.style.visibility='hidden';
+    resetCar(); applyDifficulty(currentDiff);
+    engineSound.currentTime=0; safePlay(engineSound);
+    gameLoop();
+  }
+
+  function safePlay(a){ const p=a.play(); if(p&&p.catch){p.catch(()=>{});} }
+
+  /* =====================================================
+     START GAME SETUP
+     ===================================================== */
+  function startGame(){
+    resizeCanvas();
+    applyDifficulty('normal');
+    engineSound.volume=0.4; safePlay(engineSound);
+    gameLoop();
+  }
+  </script></body>
+</html>
